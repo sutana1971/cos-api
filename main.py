@@ -1,24 +1,31 @@
+import json, os
 from fastapi import FastAPI
 from pydantic import BaseModel
 
 app = FastAPI()
+FILE = "teleport.json"
 
-# สร้างรูปแบบข้อมูล
-class ScoreData(BaseModel):
-    userId: int
-    score: int
+# ---------- helpers ----------
+def load():
+    if not os.path.exists(FILE):
+        return []
+    with open(FILE, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
 
-# test route
+def save(data):
+    with open(FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# ---------- routes ----------
 @app.get("/")
 def home():
     return {"message": "API is running"}
 
-# API endpoint
-@app.post("/score")
-def receive_score(data: ScoreData):
-    print("User:", data.userId, "Score:", data.score)
+# ดูข้อมูลทั้งหมด
+@app.get("/teleport")
+def teleport():
+    return load()
 
-    return {
-        "status": "ok",
-        "received": data
-    }
