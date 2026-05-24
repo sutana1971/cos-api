@@ -10,7 +10,7 @@ DATA_DIR = os.environ.get("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 FILE = os.path.join(DATA_DIR, "teleport.json")
 
-DEFAULT = {"teleport": 0, "jobid": "", "placeid": 0}
+DEFAULT = {"teleport": 0, "jobid": "", "placeid": 0, "mush": 0}
 
 # ---------- helpers ----------
 def ensure_file():
@@ -35,6 +35,7 @@ class ConfigUpdate(BaseModel):
     teleport: Optional[int] = None
     jobid: Optional[str] = None
     placeid: Optional[int] = None
+    mush: Optional[int] = None
 
 # ---------- routes ----------
 @app.get("/")
