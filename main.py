@@ -6,14 +6,18 @@ app = FastAPI()
 FILE = "teleport.json"
 
 # ---------- helpers ----------
-def load():
+def ensure_file():
     if not os.path.exists(FILE):
-        return []
+        with open(FILE, "w") as f:
+            json.dump({}, f)
+
+def load():
+    ensure_file()
     with open(FILE, "r") as f:
         try:
             return json.load(f)
         except json.JSONDecodeError:
-            return []
+            return {}
 
 def save(data):
     with open(FILE, "w") as f:
