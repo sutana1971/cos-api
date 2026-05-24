@@ -103,15 +103,16 @@ def add_jobid(body: JobIdBody):
     save(data)
     return {"status": "ok", "data": data}
 
-# ลบ jobid ออกจาก pool (ต้องเหลืออย่างน้อย 1)
+# ลบ jobid ออกจาก pool
+# ถ้าลบจนหมด จะแทนที่ด้วย [""] เพื่อให้ client ตัวที่ได้ "" ไป join server แบบสุ่ม
 @app.post("/jobids/remove")
 def remove_jobid(body: JobIdBody):
     data = load()
     if body.jobid not in data["jobids"]:
         raise HTTPException(404, "jobid not found")
-    if len(data["jobids"]) <= 1:
-        raise HTTPException(400, "Must keep at least one jobid")
     data["jobids"].remove(body.jobid)
+    if not data["jobids"]:
+        data["jobids"] = [""]
     save(data)
     return {"status": "ok", "data": data}
 
