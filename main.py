@@ -23,7 +23,6 @@ def migrate(data: dict) -> dict:
     if "jobids" not in data:
         old = data.pop("jobid", "")
         data["jobids"] = [old] if isinstance(old, str) and old else []
-    # ensure all default keys exist
     for k, v in DEFAULT.items():
         data.setdefault(k, v)
     return data
@@ -43,15 +42,13 @@ def save(data: dict):
 
 # ---------- rate limit (in-memory, per-minute fixed window) ----------
 _rate_lock = threading.Lock()
-_rate_window = 0   # epoch minute we're tracking
-_rate_count  = 0   # how many teleport=1 responses sent this minute
+_rate_window = 0
+_rate_count  = 0
 
 def _current_minute() -> int:
     return int(time.time() // 60)
 
 def try_consume(limit: int):
-    """Returns (allowed: bool, count_after: int).
-    If allowed, count is incremented. If not, count stays the same."""
     global _rate_window, _rate_count
     now_min = _current_minute()
     with _rate_lock:
@@ -67,7 +64,6 @@ def rate_status(limit: int):
     global _rate_window, _rate_count
     now_min = _current_minute()
     with _rate_lock:
-        # if minute rolled over, report a fresh window
         used = 0 if now_min != _rate_window else _rate_count
     return {
         "limit": limit,
@@ -77,11 +73,60 @@ def rate_status(limit: int):
         "seconds_until_reset": 60 - int(time.time()) % 60,
     }
 
+# ---------- receivers (in-memory, ephemeral) ----------
+# {username: {"placeid": int, "jobid": str, "expires": float, "last_seen": float}}
+_receivers: dict = {}
+_receivers_lock = threading.Lock()
+RECEIVER_TTL = 30  # seconds — 3x heartbeat interval (10s)
+
+def _purge_expired():
+    """Caller must hold _receivers_lock."""
+    now = time.time()
+    dead = [u for u, r in _receivers.items() if r["expires"] <= now]
+    for u in dead:
+        del _receivers[u]
+
+def heartbeat_set(username: str, placeid: int, jobid: str):
+    now = time.time()
+    with _receivers_lock:
+        _receivers[username] = {
+            "placeid":   placeid,
+            "jobid":     jobid,
+            "last_seen": now,
+            "expires":   now + RECEIVER_TTL,
+        }
+        _purge_expired()
+        return len(_receivers)
+
+def receivers_active():
+    """Returns list of active receivers (after purge)."""
+    with _receivers_lock:
+        _purge_expired()
+        now = time.time()
+        return [
+            {
+                "username":   u,
+                "placeid":    r["placeid"],
+                "jobid":      r["jobid"],
+                "expires_in": max(0, int(r["expires"] - now)),
+            }
+            for u, r in _receivers.items()
+        ]
+
+def pick_destination():
+    """Return one random active receiver's (placeid, jobid), or None if none online."""
+    with _receivers_lock:
+        _purge_expired()
+        if not _receivers:
+            return None
+        choice = random.choice(list(_receivers.values()))
+        return choice["placeid"], choice["jobid"]
+
 # ---------- models ----------
 class ConfigUpdate(BaseModel):
     teleport: Optional[int] = None
-    jobid: Optional[str] = None          # legacy: sets pool to [this]
-    jobids: Optional[List[str]] = None   # full replace of pool
+    jobid: Optional[str] = None
+    jobids: Optional[List[str]] = None
     placeid: Optional[int] = None
     mush: Optional[int] = None
     limit: Optional[int] = None
@@ -89,67 +134,92 @@ class ConfigUpdate(BaseModel):
 class JobIdBody(BaseModel):
     jobid: str
 
+class Heartbeat(BaseModel):
+    username: str
+    placeid: int
+    jobid: str
+
 # ---------- routes ----------
 @app.get("/")
 def home():
     return {"message": "API is running"}
 
-# Roblox + CLI อ่านค่าปัจจุบัน
-# Roblox ต้องส่ง ?shoom=<value> มาด้วย เพื่อให้ API นับ rate-limit เฉพาะคนที่ teleport ได้จริง
-# - teleport=0 in config         -> return 0 (no count)
-# - shoom < mush                 -> return 0 (no count)
-# - rate-limit reached            -> return 0 (no count)
-# - all pass                      -> return 1 (count +1)
+# Sender อ่านปลายทาง: ดึง (placeid, jobid) จาก Receiver ที่ active แบบสุ่ม
+# ผลลัพธ์ตาม decision tree:
+#  1) config teleport=0 -> teleport=0 (no count)
+#  2) shoom < mush       -> teleport=0 (no count)
+#  3) no active receiver -> teleport=0 (no count)
+#  4) rate-limit เต็ม     -> teleport=0 (no count)
+#  5) all pass            -> teleport=1, placeid+jobid จาก Receiver, count +1
 @app.get("/teleport")
 def teleport(shoom: Optional[int] = Query(None)):
     data = load()
-    pool = data.get("jobids") or []
-    chosen = random.choice(pool) if pool else ""
 
     tp_flag = int(data.get("teleport", 0))
     mush    = int(data.get("mush", 0))
     limit   = int(data.get("limit", 15))
 
+    placeid_out = 0
+    jobid_out   = ""
+
     if tp_flag == 1:
-        # strict: ถ้าไม่ส่ง shoom มา ถือว่าเป็น 0
         client_shoom = int(shoom) if shoom is not None else 0
         if client_shoom < mush:
-            tp_flag = 0  # ไม่ผ่านเงื่อนไข mush -> ไม่นับ slot
+            tp_flag = 0
         else:
-            allowed, _ = try_consume(limit)
-            if not allowed:
-                tp_flag = 0  # rate-limit เต็ม -> ไม่นับ (ไม่ได้ teleport)
+            dest = pick_destination()
+            if dest is None:
+                tp_flag = 0   # ไม่มี Receiver online
+            else:
+                allowed, _ = try_consume(limit)
+                if not allowed:
+                    tp_flag = 0
+                else:
+                    placeid_out, jobid_out = dest
 
     return {
         "teleport": tp_flag,
-        "placeid":  data.get("placeid", 0),
+        "placeid":  placeid_out,
         "mush":     mush,
-        "jobid":    chosen,
+        "jobid":    jobid_out,
     }
 
-# สำหรับ CLI / debug — เห็น pool ทั้งหมด
+# CLI: ดูคอนฟิกเต็ม
 @app.get("/teleport/all")
 def teleport_all():
     return load()
 
-# ดูสถานะ rate limit ปัจจุบัน
+# CLI: ดูสถานะ rate limit
 @app.get("/ratelimit")
 def ratelimit():
     data = load()
     return rate_status(int(data.get("limit", 15)))
 
-# CLI ส่งค่าใหม่มาอัปเดต (เฉพาะ field ที่ส่งมาจะถูกแทนที่)
+# CLI: รายชื่อ Receiver ที่ active
+@app.get("/receivers")
+def receivers():
+    return receivers_active()
+
+# Receiver: ส่ง heartbeat
+@app.post("/heartbeat")
+def heartbeat(hb: Heartbeat):
+    if not hb.username:
+        raise HTTPException(400, "username is empty")
+    if not hb.jobid:
+        raise HTTPException(400, "jobid is empty")
+    count = heartbeat_set(hb.username, int(hb.placeid), hb.jobid)
+    return {"status": "ok", "active_receivers": count}
+
+# CLI: อัปเดตคอนฟิก (เฉพาะ field ที่ส่งมา)
 @app.post("/config")
 def update_config(update: ConfigUpdate):
     data = load()
     payload = update.dict(exclude_none=True)
 
-    # legacy: ถ้าส่ง jobid เดี่ยวมา ให้แทนที่ pool ทั้งก้อน
+    # legacy support
     if "jobid" in payload:
         single = payload.pop("jobid")
         payload["jobids"] = [single] if single else []
-
-    # กัน limit ติดลบ
     if "limit" in payload:
         payload["limit"] = max(0, int(payload["limit"]))
 
@@ -157,7 +227,7 @@ def update_config(update: ConfigUpdate):
     save(data)
     return {"status": "ok", "data": data}
 
-# เพิ่ม jobid เข้า pool
+# ----- legacy jobid endpoints (kept for backward-compat, no longer used by Sender) -----
 @app.post("/jobids/add")
 def add_jobid(body: JobIdBody):
     if not body.jobid:
@@ -169,8 +239,6 @@ def add_jobid(body: JobIdBody):
     save(data)
     return {"status": "ok", "data": data}
 
-# ลบ jobid ออกจาก pool
-# ถ้าลบจนหมด จะแทนที่ด้วย [""] เพื่อให้ client ตัวที่ได้ "" ไป join server แบบสุ่ม
 @app.post("/jobids/remove")
 def remove_jobid(body: JobIdBody):
     data = load()
@@ -189,4 +257,5 @@ def debug():
         "FILE": FILE,
         "exists": os.path.exists(FILE),
         "size": os.path.getsize(FILE) if os.path.exists(FILE) else 0,
+        "active_receivers": len(receivers_active()),
     }
